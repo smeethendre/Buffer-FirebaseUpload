@@ -22,6 +22,8 @@ HAB_ID          = 'HAB-MUM-01'
 FIREBASE_URL    = 'https://leap-2df27-default-rtdb.firebaseio.com'
 FIREBASE_SECRET = 'h7BHFpVU3okE1UhygPInLacvb7tp2Xb9NxR0YSMN'
 
+SIMULATION_MODE = True
+
 # STM32 USB identifiers for auto-detection
 STM32_VID_PID = [
     (0x0483, 0x5740),   # STM32 Virtual COM Port
@@ -375,11 +377,152 @@ def thread_stats():
                 stats['parse_errors'],
                 stats['upload_errors'],
             )
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIMULATOR
+# Generates fake STM32 CSV packets
+# Pushes directly into raw_queue
+# ═══════════════════════════════════════════════════════════════════════════════
 
+import random
+
+
+def generate_sim_packet(seq, altitude):
+
+    bmp_t_01C = int((25 - altitude / 1000 * 2) * 10)
+
+    try:
+        bmp_p_Pa = max(
+            1000,
+            int(101325 * ((1 - altitude / 44330) ** 5.255))
+        )
+    except:
+        bmp_p_Pa = 1000
+
+    bmp_alt_m = int(altitude * 10)
+
+    aht_t_01C = bmp_t_01C + random.randint(-5, 5)
+    aht_h_01pc = random.randint(450, 700)
+
+    dsb_t_C = round((bmp_t_01C / 10) + random.uniform(-1, 1), 1)
+
+    uv_V = round(random.uniform(0.5, 4.0), 2)
+
+    ax_mg = random.randint(-100, 100)
+    ay_mg = random.randint(-100, 100)
+    az_mg = random.randint(950, 1050)
+
+    gps_lat = round(19.076000 + altitude / 1000000, 6)
+    gps_lon = round(72.877700 + altitude / 1000000, 6)
+
+    gps_fix = 1
+
+    gps_time = datetime.utcnow().strftime("%H%M%S")
+    gps_date = datetime.utcnow().strftime("%d%m%y")
+
+    return (
+        f"{seq},"
+        f"{bmp_t_01C},"
+        f"{bmp_p_Pa},"
+        f"{bmp_alt_m},"
+        f"{aht_t_01C},"
+        f"{aht_h_01pc},"
+        f"{dsb_t_C},"
+        f"{uv_V},"
+        f"{ax_mg},"
+        f"{ay_mg},"
+        f"{az_mg},"
+        f"{gps_lat},"
+        f"{gps_lon},"
+        f"{gps_fix},"
+        f"{gps_time},"
+        f"{gps_date}"
+    )
+
+
+def thread_simulator():
+
+    log.info("[SIMULATOR] Started")
+
+    seq = 1
+    altitude = 0.0
+
+    phase = "ASCENT"
+
+    while True:
+
+        if phase == "ASCENT":
+
+            altitude += random.uniform(200, 400)
+
+            if altitude >= 30000:
+                altitude = 30000
+                phase = "DESCENT"
+
+                log.info(
+                    "[SIMULATOR] BALLOON BURST @ %.0f m",
+                    altitude
+                )
+
+        elif phase == "DESCENT":
+
+            altitude -= random.uniform(250, 500)
+
+            if altitude <= 0:
+
+                altitude = 0
+
+                log.info(
+                    "[SIMULATOR] LANDED"
+                )
+
+                time.sleep(5)
+
+                phase = "ASCENT"
+                seq = 1
+
+        packet = generate_sim_packet(
+            seq,
+            altitude
+        )
+
+        log.info(
+            "[SIMULATOR] PKT #%d | ALT=%.0f m",
+            seq,
+            altitude
+        )
+
+        # EXACT SAME PIPELINE AS STM32
+
+        db = sqlite3.connect(DB_PATH)
+
+        db.execute(
+            'INSERT INTO raw_packets (raw_text) VALUES (?)',
+            (packet,)
+        )
+
+        db.commit()
+        db.close()
+
+        raw_queue.put(packet)
+
+        with stats_lock:
+            stats['packets_received'] += 1
+
+        seq += 1
+
+        time.sleep(1)
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
+
     log.info("=" * 55)
     log.info("  HAB GROUND STATION — LEAP-HABSAT-01")
+
+    if SIMULATION_MODE:
+        log.info("  MODE     : SIMULATOR")
+    else:
+        log.info("  MODE     : LIVE STM32")
+
     log.info("  Firebase : leap-2df27-default-rtdb")
     log.info("  Baud     : %d", BAUD_RATE)
     log.info("  Log      : %s", os.path.abspath(LOG_PATH))
@@ -388,21 +531,55 @@ if __name__ == '__main__':
     init_db()
     log_event('GROUND_STATION_START', datetime.utcnow().isoformat())
 
-    t1 = threading.Thread(target=thread_capture,  daemon=True, name='T1-Capture')
-    t2 = threading.Thread(target=thread_parser,   daemon=True, name='T2-Parser')
-    t3 = threading.Thread(target=thread_uploader, daemon=True, name='T3-Uploader')
-    t4 = threading.Thread(target=thread_stats,    daemon=True, name='T4-Stats')
+    # Thread 1
+    if SIMULATION_MODE:
+        t1 = threading.Thread(
+            target=thread_simulator,
+            daemon=True,
+            name='T1-Simulator'
+        )
+    else:
+        t1 = threading.Thread(
+            target=thread_capture,
+            daemon=True,
+            name='T1-Capture'
+        )
+
+    # Thread 2
+    t2 = threading.Thread(
+        target=thread_parser,
+        daemon=True,
+        name='T2-Parser'
+    )
+
+    # Thread 3
+    t3 = threading.Thread(
+        target=thread_uploader,
+        daemon=True,
+        name='T3-Uploader'
+    )
+
+    # Thread 4
+    t4 = threading.Thread(
+        target=thread_stats,
+        daemon=True,
+        name='T4-Stats'
+    )
 
     t1.start()
     t2.start()
     t3.start()
     t4.start()
 
-    log.info("All 4 threads running. Press Ctrl+C to stop.\n")
+    log.info("All threads running.\n")
 
     try:
         while True:
             time.sleep(10)
+
     except KeyboardInterrupt:
         log.info("Shutting down...")
-        log_event('GROUND_STATION_STOP', datetime.utcnow().isoformat())
+        log_event(
+            'GROUND_STATION_STOP',
+            datetime.utcnow().isoformat()
+        )
