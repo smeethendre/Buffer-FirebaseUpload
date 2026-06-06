@@ -3,19 +3,40 @@ import sqlite3
 import threading
 import queue
 import time
-import re
+import csv
 import json
 import requests
 from datetime import datetime
+from io import StringIO
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-COM_PORT         = 'COM5'
-BAUD_RATE        = 9600
-DB_PATH          = 'telemetry.db'
-HAB_ID           = 'HAB-MUM-01'
-FIREBASE_URL     = 'https://leap-2df27-default-rtdb.firebaseio.com'
-FIREBASE_SECRET  = 'h7BHFpVU3okE1UhygPInLacvb7tp2Xb9NxR0YSMN'
+COM_PORT        = 'COM5'
+BAUD_RATE       = 9600
+DB_PATH         = 'telemetry.db'
+HAB_ID          = 'HAB-MUM-01'
+FIREBASE_URL    = 'https://leap-2df27-default-rtdb.firebaseio.com'
+FIREBASE_SECRET = 'h7BHFpVU3okE1UhygPInLacvb7tp2Xb9NxR0YSMN'
 # ─────────────────────────────────────────────────────────────────────────────
+
+# CSV column order from STM32
+CSV_HEADERS = [
+    'seq',
+    'bmp_t_01C',    # BMP temperature (°C × 10)
+    'bmp_p_Pa',     # BMP pressure (Pa)
+    'bmp_alt_m',    # BMP altitude (m × 10)
+    'aht_t_01C',    # AHT temperature (°C × 10)
+    'aht_h_01pc',   # AHT humidity (% × 10)
+    'dsb_t_C',      # DS18B20 temperature (°C)
+    'uv_V',         # UV sensor voltage
+    'ax_mg',        # Accel X (mg)
+    'ay_mg',        # Accel Y (mg)
+    'az_mg',        # Accel Z (mg)
+    'gps_lat',      # GPS latitude
+    'gps_lon',      # GPS longitude
+    'gps_fix',      # GPS fix status
+    'gps_time',     # GPS time
+    'gps_date',     # GPS date
+]
 
 # ── Thread-safe queues ────────────────────────────────────────────────────────
 raw_queue    = queue.Queue()   # T1 → T2
@@ -47,7 +68,7 @@ def init_db():
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # THREAD 1 — CAPTURE
-# Read COM port → save raw text to SQLite → push to raw_queue
+# Read COM5 line by line → save raw to SQLite → push to raw_queue
 # ═══════════════════════════════════════════════════════════════════════════════
 def thread_capture():
     print(f"[T1-CAPTURE] Connecting to {COM_PORT} @ {BAUD_RATE} baud...")
@@ -61,8 +82,7 @@ def thread_capture():
             print(f"[T1-CAPTURE] Waiting for port... ({e})")
             time.sleep(2)
 
-    buffer = []
-    db     = sqlite3.connect(DB_PATH)
+    db = sqlite3.connect(DB_PATH)
 
     while True:
         try:
@@ -73,21 +93,19 @@ def thread_capture():
             if not line:
                 continue
 
+            # Skip header line if STM32 sends it on boot
+            if line.startswith('seq') or line.startswith('#'):
+                print(f"  [SERIAL] (header) {line}")
+                continue
+
             print(f"  [SERIAL] {line}")
 
-            if line.startswith('---'):
-                if buffer:
-                    raw_text = '\n'.join(buffer)
+            # Save raw to SQLite
+            db.execute('INSERT INTO raw_packets (raw_text) VALUES (?)', (line,))
+            db.commit()
 
-                    # Save raw to SQLite
-                    db.execute('INSERT INTO raw_packets (raw_text) VALUES (?)', (raw_text,))
-                    db.commit()
-
-                    # Push to parser
-                    raw_queue.put(raw_text)
-                    buffer = []
-            else:
-                buffer.append(line)
+            # Push to parser
+            raw_queue.put(line)
 
         except Exception as e:
             print(f"[T1-CAPTURE] Error: {e}")
@@ -95,76 +113,77 @@ def thread_capture():
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # THREAD 2 — PARSER
-# Take raw text from raw_queue → parse → save to SQLite → push to upload_queue
+# Take CSV line from raw_queue → parse → save decoded to SQLite → push to upload_queue
 # ═══════════════════════════════════════════════════════════════════════════════
-packet_counter = 1
-counter_lock   = threading.Lock()
+def parse_csv(line):
+    try:
+        reader = csv.reader(StringIO(line))
+        values = next(reader)
 
-def parse_packet(raw_text):
-    global packet_counter
+        if len(values) < len(CSV_HEADERS):
+            print(f"[T2-PARSER] Incomplete CSV: {len(values)} fields, expected {len(CSV_HEADERS)}")
+            return None
 
-    with counter_lock:
-        pkt_no = packet_counter
-        packet_counter += 1
+        row = dict(zip(CSV_HEADERS, values))
 
-    data = {
-        'HAB_ID':          HAB_ID,
-        'PACKET_NO':       pkt_no,
-        'MISSION_TIME':    datetime.utcnow().strftime('%H:%M:%S'),
-        'TIMESTAMP':       datetime.utcnow().isoformat(),
-        'TEMPERATURE':     0.0,
-        'PRESSURE':        0.0,
-        'HUMIDITY':        0.0,
-        'ALTITUDE':        0.0,
-        'ACCEL_X':         0.0,
-        'ACCEL_Y':         0.0,
-        'ACCEL_Z':         0.0,
-        'GYRO_X':          0.0,
-        'GYRO_Y':          0.0,
-        'GYRO_Z':          0.0,
-        'UV_INDEX':        0.0,
-        'MAGNETIC_FIELD':  0.0,
-        'LATITUDE':        0.0,
-        'LONGITUDE':       0.0,
-        'BATTERY_PERCENT': 100.0,
-        'CAMERA_STATUS':   'ON',
-        'STATUS_FLAG':     'OK',
-        'RSSI':            0,
-    }
+        # Map CSV fields → dashboard fields
+        data = {
+            'HAB_ID':          HAB_ID,
+            'PACKET_NO':       int(row['seq']),
+            'MISSION_TIME':    datetime.utcnow().strftime('%H:%M:%S'),
+            'TIMESTAMP':       datetime.utcnow().isoformat(),
 
-    for line in raw_text.split('\n'):
-        line = line.strip()
+            # Temperature — use BMP as primary, AHT as backup
+            'TEMPERATURE':     round(int(row['bmp_t_01C']) / 10.0, 2),
 
-        # MPU: AX=30 AY=-20 AZ=1029
-        if line.startswith('MPU'):
-            m = re.search(r'AX=([-\d.]+)\s+AY=([-\d.]+)\s+AZ=([-\d.]+)', line)
-            if m:
-                data['ACCEL_X'] = float(m.group(1))
-                data['ACCEL_Y'] = float(m.group(2))
-                data['ACCEL_Z'] = float(m.group(3))
+            # Pressure — convert Pa to hPa
+            'PRESSURE':        round(int(row['bmp_p_Pa']) / 100.0, 2),
 
-        # BME: T=28.03C P=100368Pa H=40.01% ALT=77m
-        elif line.startswith('BME'):
-            m = re.search(
-                r'T=([-\d.]+)C\s+P=([\d.]+)Pa\s+H=([\d.]+)%\s+ALT=([\d.]+)m',
-                line
-            )
-            if m:
-                data['TEMPERATURE'] = float(m.group(1))
-                data['PRESSURE']    = round(float(m.group(2)) / 100, 2)
-                data['HUMIDITY']    = float(m.group(3))
-                data['ALTITUDE']    = float(m.group(4))
+            # Humidity — divide by 10
+            'HUMIDITY':        round(int(row['aht_h_01pc']) / 10.0, 2),
 
-        # AHT: T=27.01C H=52.62%
-        elif line.startswith('AHT'):
-            m = re.search(r'T=([-\d.]+)C\s+H=([\d.]+)%', line)
-            if m:
-                if data['TEMPERATURE'] == 0.0:
-                    data['TEMPERATURE'] = float(m.group(1))
-                if data['HUMIDITY'] == 0.0:
-                    data['HUMIDITY'] = float(m.group(2))
+            # Altitude — divide by 10
+            'ALTITUDE':        round(int(row['bmp_alt_m']) / 10.0, 2),
 
-    return data
+            # UV
+            'UV_INDEX':        float(row['uv_V']),
+
+            # Accelerometer (mg)
+            'ACCEL_X':         float(row['ax_mg']),
+            'ACCEL_Y':         float(row['ay_mg']),
+            'ACCEL_Z':         float(row['az_mg']),
+
+            # Gyro not in CSV — set to 0
+            'GYRO_X':          0.0,
+            'GYRO_Y':          0.0,
+            'GYRO_Z':          0.0,
+
+            # Magnetic field not in CSV — set to 0
+            'MAGNETIC_FIELD':  0.0,
+
+            # GPS
+            'LATITUDE':        float(row['gps_lat']),
+            'LONGITUDE':       float(row['gps_lon']),
+
+            # Extras
+            'BATTERY_PERCENT': 100.0,
+            'CAMERA_STATUS':   'ON',
+            'STATUS_FLAG':     'OK',
+            'RSSI':            0,
+
+            # Extra fields from CSV
+            'DSB_TEMP':        float(row['dsb_t_C']),
+            'AHT_TEMP':        round(int(row['aht_t_01C']) / 10.0, 2),
+            'GPS_FIX':         int(row['gps_fix']),
+            'GPS_TIME':        str(row['gps_time']),
+            'GPS_DATE':        str(row['gps_date']),
+        }
+
+        return data
+
+    except Exception as e:
+        print(f"[T2-PARSER] Parse error: {e} | Line: {line}")
+        return None
 
 def thread_parser():
     print("[T2-PARSER] Ready.")
@@ -172,9 +191,13 @@ def thread_parser():
 
     while True:
         try:
-            raw_text = raw_queue.get(timeout=1)
+            line = raw_queue.get(timeout=1)
 
-            parsed       = parse_packet(raw_text)
+            parsed = parse_csv(line)
+            if parsed is None:
+                raw_queue.task_done()
+                continue
+
             payload_json = json.dumps(parsed)
 
             # Save decoded to SQLite
@@ -186,8 +209,10 @@ def thread_parser():
 
             print(f"[T2-PARSER] PKT #{parsed['PACKET_NO']} | "
                   f"T={parsed['TEMPERATURE']}°C | "
+                  f"P={parsed['PRESSURE']}hPa | "
                   f"ALT={parsed['ALTITUDE']}m | "
-                  f"H={parsed['HUMIDITY']}%")
+                  f"H={parsed['HUMIDITY']}% | "
+                  f"GPS=({parsed['LATITUDE']},{parsed['LONGITUDE']})")
 
             # Push to uploader
             upload_queue.put(parsed)
@@ -200,7 +225,7 @@ def thread_parser():
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # THREAD 3 — UPLOADER
-# Take parsed dict from upload_queue → POST to Firebase REST → mark uploaded
+# Take parsed dict from upload_queue → POST to Firebase → mark uploaded in SQLite
 # ═══════════════════════════════════════════════════════════════════════════════
 def thread_uploader():
     print("[T3-UPLOADER] Ready.")
@@ -223,12 +248,12 @@ def thread_uploader():
                     print(f"[T3-UPLOADER] PKT #{data['PACKET_NO']} → Firebase ✓")
                 else:
                     print(f"[T3-UPLOADER] Firebase error {resp.status_code}: {resp.text}")
-                    upload_queue.put(data)  # retry
+                    upload_queue.put(data)
                     time.sleep(3)
 
             except requests.exceptions.RequestException as e:
                 print(f"[T3-UPLOADER] Network error: {e}")
-                upload_queue.put(data)  # retry
+                upload_queue.put(data)
                 time.sleep(3)
 
             upload_queue.task_done()
